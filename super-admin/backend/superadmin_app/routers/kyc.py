@@ -35,14 +35,31 @@ def _row_out(r: dict) -> dict[str, Any]:
             data = _json.loads(data)
         except (ValueError, TypeError):
             data = {}
+    name = (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip()
+            or r.get("email"))
+    segment = data.get("segment") or r.get("segment")
+    submitted = (r.get("submitted_at") or r.get("updated_at"))
+    submitted_iso = submitted.isoformat() if hasattr(submitted, "isoformat") else submitted
     return {
+        # FE MockKycCase field names (canonical):
+        "id": f"KYC-{r['account_id']}",
+        "contributorName": name,
+        "contributorEmail": r.get("email"),
+        "dob": data.get("dob"),
+        "country": data.get("country"),
+        "track": data.get("track") or segment,
+        "submittedAt": submitted_iso,
+        "slaHours": data.get("slaHours") or 24,
+        "idType": data.get("idType"),
+        "idNumberLast4": data.get("idNumberLast4"),
+        "autoChecks": data.get("autoChecks") or [],
+        "status": r.get("status"),
+        # Back-compat keys (existing consumers):
         "accountId": r["account_id"],
         "email": r.get("email"),
-        "name": (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip()
-                 or r.get("email")),
+        "name": name,
         "role": r.get("role"),
-        "segment": data.get("segment") or r.get("segment"),
-        "status": r.get("status"),
+        "segment": segment,
         "data": data,
         "updatedAt": r["updated_at"].isoformat() if r.get("updated_at") else None,
     }
@@ -302,7 +319,10 @@ async def get_kyc(account_id: int, admin: Annotated[dict, Depends(get_current_ad
 
 
 class KycDecision(BaseModel):
-    decision: str  # 'approve' | 'reject'
+    # Accept both the backend key (decision) and the FE key (outcome).
+    decision: str | None = None       # approve | reject | more_info
+    outcome: str | None = None        # FE: approved | rejected | more_info
+    reason: str | None = None
     note: str | None = None
 
 
@@ -313,7 +333,13 @@ async def decide_kyc(
     request: Request,
     admin: Annotated[dict, Depends(get_current_admin)],
 ):
-    new_status = "verified" if body.decision in ("approve", "approved", "verify") else "rejected"
+    verdict = (body.decision or body.outcome or "").lower()
+    if verdict in ("approve", "approved", "verify"):
+        new_status = "verified"
+    elif verdict in ("more_info", "request_info", "awaiting_info"):
+        new_status = "awaiting_info"
+    else:
+        new_status = "rejected"
     conn = get_pg_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT account_id, data FROM contributor_kyc WHERE account_id = %s", (account_id,))

@@ -373,15 +373,29 @@ async def list_mentors(admin: Annotated[dict, Depends(get_current_admin)]):
     conn = get_pg_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, first_name, last_name, role, is_active, created_at FROM login_accounts "
+            "SELECT id, email, first_name, last_name, role, is_active, created_at, "
+            "       department, phone "
+            "FROM login_accounts "
             "WHERE role LIKE 'mentor%' AND COALESCE(is_active, TRUE) ORDER BY created_at DESC")
         rows = cur.fetchall()
-    mentors = [{
-        "id": str(r["id"]), "email": r["email"],
-        "name": (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip() or r["email"]),
-        "role": r["role"], "status": "active" if r.get("is_active", True) else "paused",
-        "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
-    } for r in rows]
+    mentors = []
+    for r in rows:
+        created = r["created_at"].isoformat() if r.get("created_at") else None
+        mentors.append({
+            "id": str(r["id"]), "email": r["email"],
+            "name": (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip() or r["email"]),
+            "country": r.get("department") or "",        # no dedicated column yet
+            # FE MockAdminMentor expects `roles` as an array (the role family).
+            "role": r["role"],                            # kept for assignment pickers
+            "roles": [r["role"]] if r.get("role") else [],
+            "pools": [],
+            "status": "active" if r.get("is_active", True) else "paused",
+            "activeSince": created,
+            "createdAt": created,
+            # 30-day metrics not tracked at account level yet — surfaced as 0.
+            "reviews30d": 0, "sessions30d": 0, "escalations30d": 0,
+            "avgReviewMin": 0, "slaHitPct": 0,
+        })
     return {"mentors": mentors, "items": mentors, "total": len(mentors)}
 
 
