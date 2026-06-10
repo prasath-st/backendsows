@@ -164,6 +164,8 @@ def _version_out(row: dict, template_name: str, agent_id: str, active_prompt_id:
             variables = json.loads(variables)
         except (ValueError, TypeError):
             variables = []
+    is_active = row["id"] == active_prompt_id
+    created_iso = row["created_at"].isoformat() if row.get("created_at") else None
     return {
         "id": row["id"],
         "promptTemplateId": row["prompt_template_id"],
@@ -172,10 +174,17 @@ def _version_out(row: dict, template_name: str, agent_id: str, active_prompt_id:
         "version": row["version"],
         "body": row.get("body", ""),
         "variables": variables,
+        # FE PromptVersion field names:
+        "status": "active" if is_active else "inactive",
+        "activatedAt": created_iso if is_active else None,
+        "author": row.get("created_by"),
+        "changelog": row.get("notes"),
+        "expectedSchema": row.get("expected_schema") or "",
+        # Back-compat keys:
         "notes": row.get("notes"),
         "createdBy": row.get("created_by"),
-        "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
-        "isActive": row["id"] == active_prompt_id,
+        "createdAt": created_iso,
+        "isActive": is_active,
     }
 
 
