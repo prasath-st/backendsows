@@ -50,37 +50,79 @@ def find_account_by_id(account_id: str) -> dict[str, Any] | None:
 
 
 # ── Tenants ──────────────────────────────────────────────────────────────────
+# Tenants live in the Prisma "Tenant" table (PascalCase, quoted) — the SAME
+# table the canonical frontend/backend (newfrontend) reads. NOT the snake_case
+# `tenants` table. Columns: id, slug, name, domain, subscriptionTier, status,
+# region, currency, timezone, contractRef, provisionedAt, usageCounters(jsonb),
+# rateCards, retentionRules, ssoConfig, workforcePolicy, createdAt, updatedAt.
+
+# UI tier (TitleCase) ↔ DB subscriptionTier (lowercase).
+_TIER_TO_DB = {"enterprise": "enterprise", "growth": "growth", "pilot": "pilot", "trial": "trial"}
+_TIER_TO_UI = {"enterprise": "Enterprise", "growth": "Growth", "pilot": "Pilot", "trial": "Trial"}
+
+
+def tier_to_db(tier: str | None) -> str:
+    return _TIER_TO_DB.get((tier or "pilot").strip().lower(), "pilot")
+
+
+def tier_to_ui(tier: str | None) -> str:
+    return _TIER_TO_UI.get((tier or "pilot").strip().lower(), "Pilot")
+
 
 def get_tenant(tenant_id: str) -> dict[str, Any] | None:
+    """Look up a tenant by id OR slug in the Prisma "Tenant" table."""
     conn = _conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM tenants WHERE id = %s", (tenant_id,))
+        cur.execute('SELECT * FROM "Tenant" WHERE (id = %s OR slug = %s) AND "deletedAt" IS NULL',
+                    (tenant_id, tenant_id))
         return cur.fetchone()
 
 
 def create_tenant(
     *,
-    tenant_id: str,
+    tenant_id: str | None = None,
+    slug: str,
     name: str,
-    kind: str = "enterprise",
-    metadata: dict[str, Any] | None = None,
-    is_active: bool = True,
+    domain: str | None = None,
+    tier: str = "enterprise",          # accepts UI TitleCase or db lowercase
+    status: str = "active",
+    region: str = "IN",
+    currency: str = "INR",
+    timezone: str = "Asia/Kolkata",
+    contract_ref: str | None = None,
+    usage_counters: dict[str, Any] | None = None,
+    rate_cards: dict[str, Any] | None = None,
+    retention_rules: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Insert a tenant row (idempotent — upserts on id so callers can safely
-    'ensure' a tenant). Returns the row."""
+    """Insert a row into the Prisma "Tenant" table (upsert on id). Maps the
+    New-Tenant wizard fields to the real columns. Returns the row."""
+    tid = tenant_id or f"tnt-{slug}"
     conn = _conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
-            INSERT INTO tenants (id, name, kind, metadata, is_active)
-            VALUES (%s, %s, %s, %s, %s)
+            '''
+            INSERT INTO "Tenant"
+                (id, slug, name, domain, "subscriptionTier", status, region, currency,
+                 timezone, "contractRef", "usageCounters", "rateCards", "retentionRules",
+                 "provisionedAt", "createdAt", "updatedAt")
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now(), now())
             ON CONFLICT (id) DO UPDATE
                SET name = EXCLUDED.name,
-                   kind = EXCLUDED.kind,
-                   metadata = tenants.metadata || EXCLUDED.metadata
+                   domain = EXCLUDED.domain,
+                   "subscriptionTier" = EXCLUDED."subscriptionTier",
+                   status = EXCLUDED.status,
+                   region = EXCLUDED.region,
+                   currency = EXCLUDED.currency,
+                   timezone = EXCLUDED.timezone,
+                   "contractRef" = EXCLUDED."contractRef",
+                   "updatedAt" = now()
             RETURNING *
-            """,
-            (tenant_id, name, kind, Json(metadata or {}), is_active),
+            ''',
+            (tid, slug, name, domain, tier_to_db(tier), status, region, currency,
+             timezone, contract_ref,
+             Json(usage_counters) if usage_counters is not None else None,
+             Json(rate_cards) if rate_cards is not None else None,
+             Json(retention_rules) if retention_rules is not None else None),
         )
         row = cur.fetchone()
     conn.commit()
@@ -89,11 +131,15 @@ def create_tenant(
 
 def ensure_tenant(tenant_id: str, name: str, kind: str = "enterprise",
                   metadata: dict[str, Any] | None = None) -> None:
-    """Create the tenant row if it doesn't exist (keeps the tenants table in
-    sync when accounts are provisioned with a tenant_id). Best-effort."""
+    """Create the "Tenant" row if it doesn't exist (keeps the table in sync when
+    an enterprise account is provisioned with a tenant_id). Best-effort.
+    tenant_id here is treated as the slug; the row id becomes tnt-<slug>."""
     try:
         if not get_tenant(tenant_id):
-            create_tenant(tenant_id=tenant_id, name=name, kind=kind, metadata=metadata)
+            slug = tenant_id[4:] if tenant_id.startswith("tnt-") else tenant_id
+            create_tenant(tenant_id=tenant_id if tenant_id.startswith("tnt-") else None,
+                          slug=slug, name=name, tier=kind, status="active",
+                          contract_ref=(metadata or {}).get("companyCode"))
     except Exception:  # noqa: BLE001
         pass
 

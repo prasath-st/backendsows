@@ -118,56 +118,58 @@ def _derive_msa_ref(tenant_id: str, metadata: dict[str, Any]) -> str:
     return metadata.get("msaRef") or metadata.get("msa_ref") or f"MSA-{tenant_id}"
 
 
+_DB_TIER_TO_UI = {"enterprise": "Enterprise", "growth": "Growth", "pilot": "Pilot", "trial": "Trial"}
+_REGION_LABEL = {"IN": "Asia-South", "US": "Americas", "EU": "Europe", "UK": "Europe"}
+
+
 def _tenant_out(
     t_row: dict[str, Any],
     user_count: int,
     sow_count: int,
     sub_row: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Convert raw DB rows into the MockTenant shape the FE expects."""
-    metadata: dict[str, Any] = t_row.get("metadata") or {}
-    if isinstance(metadata, str):
+    """Map a Prisma "Tenant" row into the MockTenant shape the FE expects.
+    (Columns: id, slug, name, domain, subscriptionTier, status, region,
+    currency, contractRef, provisionedAt, createdAt, retentionRules, ...)"""
+    tier = _DB_TIER_TO_UI.get((t_row.get("subscriptionTier") or "pilot").lower(), "Pilot")
+    region_code = t_row.get("region") or "IN"
+    currency = t_row.get("currency") or "INR"
+    region_disp = f"{_REGION_LABEL.get(region_code, region_code)} · {currency}"
+    counters = t_row.get("usageCounters") or {}
+    if isinstance(counters, str):
         try:
-            metadata = json.loads(metadata)
+            counters = json.loads(counters)
         except (ValueError, TypeError):
-            metadata = {}
-
-    is_active: bool = bool(t_row.get("is_active", True))
-
-    # Tier: prefer subscription plan_code, fall back to kind or metadata.
-    if sub_row and sub_row.get("plan_code"):
-        tier = _PLAN_TIER.get(sub_row["plan_code"], "Pilot")
-    else:
-        tier = (
-            _PLAN_TIER.get(metadata.get("tier", "").lower(), None)
-            or _KIND_TIER.get(t_row.get("kind", ""), "Pilot")
-        )
-
-    sub_status = sub_row.get("tenant_status") if sub_row else None
+            counters = {}
 
     return {
         "id": t_row["id"],
+        "slug": t_row.get("slug"),
         "name": t_row.get("name") or t_row["id"],
-        "domain": _derive_domain(t_row["id"], metadata),
+        "domain": t_row.get("domain") or "",
         "tier": tier,
-        "status": _derive_status(is_active, metadata, sub_status),
+        "status": t_row.get("status") or "active",
         "users": user_count,
         "sows": sow_count,
-        "provisionedAt": _iso(t_row.get("created_at")),
-        "msaRef": _derive_msa_ref(t_row["id"], metadata),
-        "region": _derive_region(metadata),
-        "currency": _derive_currency(metadata),
-        # Optional fields — populated from metadata if stored, else omitted (None).
-        "payouts30d": metadata.get("payouts30d") or None,
-        "lastHrisSyncAt": metadata.get("lastHrisSyncAt") or metadata.get("last_hris_sync_at") or None,
+        "provisionedAt": _iso(t_row.get("provisionedAt") or t_row.get("createdAt")),
+        "msaRef": t_row.get("contractRef") or "",
+        "region": region_disp,
+        "currency": currency,
+        "payouts30d": counters.get("payouts30d") or None,
+        "lastHrisSyncAt": _iso(t_row.get("lastHrisSyncAt")) if t_row.get("lastHrisSyncAt") else None,
     }
 
 
 # ── bulk data fetchers ────────────────────────────────────────────────────────
 
+_TENANT_COLS = ('id, slug, name, domain, "subscriptionTier", status, region, currency, '
+                '"contractRef", "usageCounters", "provisionedAt", "createdAt"')
+
+
 def _fetch_all_tenants(conn) -> list[dict[str, Any]]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT id, name, kind, metadata, is_active, created_at FROM tenants ORDER BY created_at DESC")
+        cur.execute(f'SELECT {_TENANT_COLS} FROM "Tenant" WHERE "deletedAt" IS NULL '
+                    'ORDER BY "createdAt" DESC')
         return list(cur.fetchall())
 
 
@@ -299,8 +301,8 @@ async def get_tenant(
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, name, kind, metadata, is_active, created_at FROM tenants WHERE id = %s",
-            (tenant_id,),
+            f'SELECT {_TENANT_COLS} FROM "Tenant" WHERE (id = %s OR slug = %s) AND "deletedAt" IS NULL',
+            (tenant_id, tenant_id),
         )
         t_row = cur.fetchone()
 
@@ -377,28 +379,33 @@ async def create_tenant(
         raise HTTPException(status_code=422, detail="name is required")
     kind = body.kind if body.kind in ("enterprise", "university", "women_team") else "enterprise"
 
-    # Prefer the wizard's user-chosen slug/tenantId; fall back to an auto id.
-    chosen = (body.slug or body.tenantId or "").strip()
-    tenant_id = _slugify(chosen) if chosen else _slug_tenant_id(name, kind)
-    if auth_repo.get_tenant(tenant_id):
-        raise HTTPException(status_code=409, detail=f"Tenant id '{tenant_id}' already exists")
+    # Prefer the wizard's user-chosen slug/tenantId; fall back to a slug from name.
+    slug = _slugify((body.slug or body.tenantId or name).strip())
+    tenant_id = f"tnt-{slug}"
+    if auth_repo.get_tenant(slug) or auth_repo.get_tenant(tenant_id):
+        raise HTTPException(status_code=409, detail=f"Tenant '{slug}' already exists")
 
-    metadata = {
-        "domain": body.domain or f"{tenant_id}.com",
-        "tier": body.tier or "Enterprise",
-        "msaRef": body.msaRef,
-        "region": body.region, "currency": body.currency or "INR",
-        "timezone": body.timezone,
-        "rolesEnabled": body.rolesEnabled or {},
-        "compliance": {
-            "retentionAudit": body.retentionAudit,
-            "retentionEvidence": body.retentionEvidence,
-            "residencyRegion": body.residencyRegion,
-            "consentVersion": body.consentVersion,
-        },
-        "status": "active", "createdBy": admin.get("email"),
+    # Compliance baseline + licensed roles → retentionRules / usageCounters JSONB.
+    retention_rules = {
+        "retentionAudit": body.retentionAudit,
+        "retentionEvidence": body.retentionEvidence,
+        "residencyRegion": body.residencyRegion,
+        "consentVersion": body.consentVersion,
     }
-    tenant = auth_repo.create_tenant(tenant_id=tenant_id, name=name, kind=kind, metadata=metadata)
+    usage_counters = {"rolesEnabled": body.rolesEnabled or {}, "createdBy": admin.get("email")}
+
+    tenant = auth_repo.create_tenant(
+        tenant_id=tenant_id, slug=slug, name=name,
+        domain=body.domain or None,
+        tier=body.tier or kind,            # UI TitleCase or kind → mapped to lowercase in repo
+        status="active",
+        region=body.region or "IN",
+        currency=body.currency or "INR",
+        timezone=body.timezone or "Asia/Kolkata",
+        contract_ref=body.msaRef,
+        usage_counters=usage_counters,
+        retention_rules=retention_rules,
+    )
 
     provisioned_admin = None
     if body.adminEmail:
@@ -441,11 +448,16 @@ async def create_tenant(
     except Exception:  # noqa: BLE001
         pass
 
+    # Return the MockTenant shape the frontend consumes (TitleCase tier, msaRef,
+    # region·currency, users/sows counts).
+    region_disp = f"{body.region or 'IN'} · {body.currency or 'INR'}"
     return {
-        "id": tenant_id, "slug": tenant_id, "name": name, "kind": kind,
-        "domain": metadata["domain"], "tier": metadata["tier"],
-        "msaRef": metadata["msaRef"], "region": body.region,
-        "currency": metadata["currency"], "status": "active",
-        "createdAt": _iso(tenant.get("created_at")) if isinstance(tenant, dict) else None,
+        "id": tenant_id, "slug": slug, "name": name,
+        "domain": body.domain or "", "tier": auth_repo.tier_to_ui(body.tier or kind),
+        "status": "active", "users": 1 if provisioned_admin else 0, "sows": 0,
+        "provisionedAt": _iso(tenant.get("provisionedAt") or tenant.get("createdAt"))
+            if isinstance(tenant, dict) else None,
+        "msaRef": body.msaRef or "", "region": region_disp,
+        "currency": body.currency or "INR",
         "admin": provisioned_admin,
     }
