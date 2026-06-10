@@ -322,23 +322,44 @@ async def get_tenant(
 # ── POST /api/superadmin/tenants  (create a tenant + optional first admin) ─────
 
 class _CreateTenantRequest(BaseModel):
+    """Accepts the full New-Tenant wizard payload (6 steps). Only name + a
+    tenant id (slug or auto) are strictly required; the rest are stored as
+    tenant metadata or used to provision the first admin."""
     name: str
-    kind: str = "enterprise"          # enterprise | university | women_team
+    # Step 1 — tenant info
+    slug: str | None = None           # user-chosen Tenant ID (URL slug)
+    tenantId: str | None = None       # alias for slug
     domain: str | None = None
-    region: str | None = None
-    currency: str | None = None
-    # Optional: provision the first enterprise-admin account for this tenant.
+    tier: str | None = None           # Enterprise | Growth | Pilot
+    msaRef: str | None = None
+    kind: str = "enterprise"          # enterprise | university | women_team
+    # Step 2 — primary admin
     adminEmail: str | None = None
+    adminName: str | None = None      # single name field from the wizard
     adminFirstName: str | None = None
     adminLastName: str | None = None
+    # Step 3 — licensed roles
+    rolesEnabled: dict[str, bool] | None = None
+    # Step 4 — region & currency
+    region: str | None = None
+    currency: str | None = None
+    timezone: str | None = None
+    # Step 5 — compliance baseline
+    retentionAudit: str | None = None
+    retentionEvidence: str | None = None
+    residencyRegion: str | None = None
+    consentVersion: str | None = None
+
+
+def _slugify(name: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "-", (name or "tenant").lower()).strip("-")[:40] or "tenant"
 
 
 def _slug_tenant_id(name: str, kind: str) -> str:
-    import re as _re
     import secrets as _secrets
-    base = _re.sub(r"[^a-z0-9]+", "-", (name or "tenant").lower()).strip("-")[:24] or "tenant"
     prefix = {"university": "uni", "women_team": "wt"}.get(kind, "ent")
-    return f"{prefix}-{base}-{_secrets.token_hex(3)}"
+    return f"{prefix}-{_slugify(name)[:24]}-{_secrets.token_hex(3)}"
 
 
 @router.post("/api/superadmin/tenants", status_code=201)
@@ -346,18 +367,35 @@ async def create_tenant(
     admin: Annotated[dict, Depends(get_current_admin)],
     body: _CreateTenantRequest = Body(...),
 ):
-    """Create a new tenant (super-admin provisioning). Inserts the tenants row,
-    optionally provisions the first admin account with a default password that
-    must be reset on first login, and emails the credentials."""
+    """Create a new tenant (super-admin provisioning) from the New-Tenant wizard.
+    Uses the wizard's slug as the tenant id when provided; stores tier / MSA ref /
+    licensed roles / region+currency / compliance baseline as metadata; and
+    optionally provisions the first admin with a default password (emailed +
+    forced reset on first login)."""
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=422, detail="name is required")
     kind = body.kind if body.kind in ("enterprise", "university", "women_team") else "enterprise"
 
-    tenant_id = _slug_tenant_id(name, kind)
+    # Prefer the wizard's user-chosen slug/tenantId; fall back to an auto id.
+    chosen = (body.slug or body.tenantId or "").strip()
+    tenant_id = _slugify(chosen) if chosen else _slug_tenant_id(name, kind)
+    if auth_repo.get_tenant(tenant_id):
+        raise HTTPException(status_code=409, detail=f"Tenant id '{tenant_id}' already exists")
+
     metadata = {
         "domain": body.domain or f"{tenant_id}.com",
+        "tier": body.tier or "Enterprise",
+        "msaRef": body.msaRef,
         "region": body.region, "currency": body.currency or "INR",
+        "timezone": body.timezone,
+        "rolesEnabled": body.rolesEnabled or {},
+        "compliance": {
+            "retentionAudit": body.retentionAudit,
+            "retentionEvidence": body.retentionEvidence,
+            "residencyRegion": body.residencyRegion,
+            "consentVersion": body.consentVersion,
+        },
         "status": "active", "createdBy": admin.get("email"),
     }
     tenant = auth_repo.create_tenant(tenant_id=tenant_id, name=name, kind=kind, metadata=metadata)
@@ -367,10 +405,17 @@ async def create_tenant(
         email = body.adminEmail.strip().lower()
         if auth_repo.find_account_by_email(email):
             raise HTTPException(status_code=409, detail="An account with that admin email already exists")
+        # Split the wizard's single adminName into first/last (fallback to explicit fields).
+        first = body.adminFirstName
+        last = body.adminLastName
+        if not first and body.adminName:
+            parts = body.adminName.strip().split(" ", 1)
+            first = parts[0]
+            last = parts[1] if len(parts) > 1 else ""
         temp = generate_temp_password()
         acct = auth_repo.create_account(
             email=email, password_hash=hash_password(temp),
-            first_name=body.adminFirstName or "", last_name=body.adminLastName or "",
+            first_name=first or "", last_name=last or "",
             role="enterprise", provider="password", email_verified=True,
             tenant_id=tenant_id, must_change_password=True,
         )
@@ -378,7 +423,7 @@ async def create_tenant(
             login_url = getattr(__import__("shared.config", fromlist=["settings"]).settings,
                                 "app_base_url", None) or "https://app.glimmora.ai"
             text, html = build_credentials_body(
-                name=(body.adminFirstName or email), email=email, temp_password=temp,
+                name=(first or email), email=email, temp_password=temp,
                 login_url=login_url, org_name=name)
             send_email(to_email=email, subject="Your Glimmora admin credentials",
                        body=text, html=html)
@@ -397,8 +442,10 @@ async def create_tenant(
         pass
 
     return {
-        "id": tenant_id, "name": name, "kind": kind,
-        "domain": metadata["domain"], "status": "active",
+        "id": tenant_id, "slug": tenant_id, "name": name, "kind": kind,
+        "domain": metadata["domain"], "tier": metadata["tier"],
+        "msaRef": metadata["msaRef"], "region": body.region,
+        "currency": metadata["currency"], "status": "active",
         "createdAt": _iso(tenant.get("created_at")) if isinstance(tenant, dict) else None,
         "admin": provisioned_admin,
     }
