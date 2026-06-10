@@ -8,6 +8,7 @@ reviewer invitation / resend flows the frontend reviewer pages proxy to.
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,7 +16,8 @@ from pydantic import BaseModel
 
 from shared.audit import write_audit
 from shared.config import settings
-from shared.deps import get_current_admin, get_current_superadmin
+from shared.db import get_pg_connection
+from shared.deps import get_current_admin, get_current_superadmin, get_current_user
 from shared.kafka_bus import publish_event
 from shared.mailer import build_credentials_body, send_email
 from shared.security import generate_temp_password, hash_password
@@ -344,3 +346,320 @@ async def reviewer_resend_invite(
 async def reviewer_list(admin: Annotated[dict, Depends(get_current_admin)]):
     reviewers = repo.list_reviewers()
     return {"reviewers": reviewers, "total": len(reviewers)}
+
+
+# ── Resend credentials (any provisioned account) ──────────────────────────────
+
+class _ResendCredsRequest(BaseModel):
+    userId: str | None = None
+    email: str | None = None
+
+
+@router.post("/api/superadmin/users/resend-credentials")
+async def resend_credentials(
+    body: _ResendCredsRequest,
+    admin: Annotated[dict, Depends(get_current_admin)],
+    request: Request,
+):
+    """Regenerate a default/temp password for a provisioned account, email it,
+    and force must_change_password so the user resets it on next login."""
+    acct = None
+    if body.userId:
+        acct = repo.find_account_by_id(body.userId)
+    if not acct and body.email:
+        acct = repo.find_account_by_email(body.email)
+    if not acct:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    temp = generate_temp_password()
+    repo.set_temp_password(str(acct["id"]), hash_password(temp))
+
+    name = (f"{acct.get('first_name', '') or ''} {acct.get('last_name', '') or ''}".strip()
+            or acct.get("email"))
+    login_url = getattr(settings, "app_base_url", None) or "https://app.glimmora.ai"
+    text, html = build_credentials_body(
+        name=name, email=acct["email"], temp_password=temp,
+        login_url=login_url, org_name=None,
+    )
+    sent = send_email(to_email=acct["email"], subject="Your Glimmora credentials",
+                      body=text, html=html)
+    try:
+        write_audit(
+            actor_id=admin.get("id"), actor_email=admin.get("email"),
+            actor_role=admin.get("role"), action="resend_credentials",
+            target=acct["email"], target_id=str(acct["id"]),
+            tenant_id=acct.get("tenant_id"),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "emailSent": bool(sent), "email": acct["email"],
+            "mustChangePassword": True}
+
+
+# ── GET /api/superadmin/mentors/{mentor_id} ───────────────────────────────────
+
+def _mentor_out(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a login_accounts row into the mentor detail the FE mentor-detail-workspace expects."""
+    if not row:
+        return {}
+    name = (row.get("name") or
+            f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip() or
+            row.get("email") or "")
+    role = row.get("role") or "mentor"
+    # Derive status from is_active + approval_status columns.
+    approval = (row.get("approval_status") or "").lower()
+    is_active = row.get("is_active", True)
+    if approval == "rejected":
+        status = "closed"
+    elif approval in ("pending", "") and not row.get("last_login_at"):
+        status = "pending"
+    elif not is_active:
+        status = "paused"
+    else:
+        status = "active"
+    # roles[] — the primary role + any stored tier variants from the name column
+    roles: list[str] = []
+    valid_mentor_roles = {"mentor", "mentor.senior", "mentor.lead"}
+    if role.lower() in valid_mentor_roles:
+        roles = [role.lower()]
+    else:
+        roles = ["mentor"]
+    return {
+        "id": str(row["id"]),
+        "email": row.get("email"),
+        "name": name,
+        "firstName": row.get("first_name") or "",
+        "lastName": row.get("last_name") or "",
+        "role": role,
+        "roles": roles,
+        "pools": [],
+        "status": status,
+        "activeSince": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "createdAt": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "lastLoginAt": row.get("last_login_at").isoformat() if row.get("last_login_at") else None,
+        "phone": row.get("phone"),
+        "country": row.get("department") or "",
+        "competency": [],
+        # 30-day counters — not tracked at account level; default 0
+        "reviews30d": 0,
+        "sessions30d": 0,
+        "escalations30d": 0,
+        "avgReviewMin": 0,
+        "slaHitPct": 0,
+    }
+
+
+def _list_mentor_competency(mentor_id: str) -> list[dict[str, Any]]:
+    """Read mentor competency rows from admin_records (kind='mentor_competency')."""
+    conn = get_pg_connection()
+    with conn.cursor() as cur:
+        from psycopg2.extras import RealDictCursor
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """
+            SELECT data FROM admin_records
+             WHERE kind = 'mentor_competency'
+               AND status != 'deleted'
+               AND data->>'mentorId' = %s
+             ORDER BY created_at ASC
+            """,
+            (str(mentor_id),),
+        )
+        rows = cur.fetchall()
+    result = []
+    for r in rows:
+        d = r.get("data")
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except (ValueError, TypeError):
+                d = {}
+        if d:
+            result.append(d)
+    return result
+
+
+@router.get("/api/superadmin/mentors/{mentor_id}")
+async def get_mentor_detail(
+    mentor_id: str,
+    admin: Annotated[dict, Depends(get_current_admin)],
+):
+    """Single mentor detail — login_accounts row WHERE role LIKE 'mentor%'."""
+    conn = get_pg_connection()
+    from psycopg2.extras import RealDictCursor
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM login_accounts WHERE id = %s AND LOWER(role) LIKE 'mentor%'",
+            (mentor_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Mentor not found")
+    mentor = _mentor_out(row)
+    competency = _list_mentor_competency(mentor_id)
+    mentor["competency"] = competency
+    return {"mentor": mentor, "competency": competency}
+
+
+# ── GET /api/superadmin/mentors ───────────────────────────────────────────────
+# (The list endpoint GET /api/superadmin/mentors lives in audit.py, which returns
+# both `mentors` and `items`. Only the detail endpoint above is owned here.)
+
+
+# ── GET /api/v1/users/search?q= ──────────────────────────────────────────────
+
+@router.get("/api/v1/users/search")
+async def search_users(
+    q: str = "",
+    limit: int = 50,
+    admin: Annotated[dict, Depends(get_current_admin)] = None,  # type: ignore[assignment]
+):
+    """Search login_accounts by email or name (case-insensitive ILIKE)."""
+    conn = get_pg_connection()
+    from psycopg2.extras import RealDictCursor
+    pattern = f"%{q.strip()}%"
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT * FROM login_accounts
+             WHERE (email ILIKE %s OR name ILIKE %s
+                    OR first_name ILIKE %s OR last_name ILIKE %s)
+             ORDER BY created_at DESC
+             LIMIT %s
+            """,
+            (pattern, pattern, pattern, pattern, limit),
+        )
+        rows = cur.fetchall()
+    return {"query": q, "results": [repo.user_out(r) for r in rows], "total": len(rows)}
+
+
+# ── /api/v1/users/me/profile (GET / PATCH / POST picture) ────────────────────
+
+class UpdateProfileRequest(BaseModel):
+    firstName: str | None = None
+    lastName: str | None = None
+    phone: str | None = None
+
+
+class ProfilePictureRequest(BaseModel):
+    url: str | None = None
+    blobRef: str | None = None
+
+
+@router.get("/api/v1/users/me/profile")
+async def get_my_profile(
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    """Return the current user's profile from login_accounts."""
+    account_id = user.get("id")
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Cannot resolve user identity")
+    row = repo.find_account_by_id(str(account_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    out = repo.user_out(row)
+    # Expose picture_url if present on the row
+    out["pictureUrl"] = row.get("picture_url") or row.get("profile_picture_url") or None
+    return out
+
+
+@router.patch("/api/v1/users/me/profile")
+async def update_my_profile(
+    body: UpdateProfileRequest,
+    request: Request,
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    """Update first/last name and phone for the current user."""
+    account_id = user.get("id")
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Cannot resolve user identity")
+    row = repo.find_account_by_id(str(account_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    first = body.firstName if body.firstName is not None else row.get("first_name") or ""
+    last = body.lastName if body.lastName is not None else row.get("last_name") or ""
+    phone = body.phone if body.phone is not None else row.get("phone")
+    name = f"{first} {last}".strip() or row.get("email")
+
+    conn = get_pg_connection()
+    from psycopg2.extras import RealDictCursor
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            UPDATE login_accounts
+               SET first_name = %s, last_name = %s, name = %s,
+                   phone = %s, updated_at = now()
+             WHERE id = %s
+             RETURNING *
+            """,
+            (first, last, name, phone, account_id),
+        )
+        updated = cur.fetchone()
+    conn.commit()
+
+    write_audit(
+        actor_id=user.get("id"), actor_email=user.get("email"), actor_role=user.get("role"),
+        action="update_profile", target="login_accounts", target_id=str(account_id),
+        service="superadmin-service",
+        ip_address=request.client.host if request.client else None,
+    )
+    out = repo.user_out(updated or row)
+    out["pictureUrl"] = (updated or row).get("picture_url") or None
+    return out
+
+
+@router.post("/api/v1/users/me/profile-picture")
+async def update_profile_picture(
+    body: ProfilePictureRequest,
+    request: Request,
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    """Store a profile picture URL / blob reference on the current user's account."""
+    account_id = user.get("id")
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Cannot resolve user identity")
+    pic_url = body.url or body.blobRef or ""
+    if not pic_url:
+        raise HTTPException(status_code=422, detail="url or blobRef is required")
+
+    conn = get_pg_connection()
+    # picture_url column may not exist yet — use a best-effort UPDATE that adds it
+    # via a JSONB merge into the existing data column, or just update if column exists.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE login_accounts
+                ADD COLUMN IF NOT EXISTS picture_url TEXT
+                """,
+            )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+
+    from psycopg2.extras import RealDictCursor
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            UPDATE login_accounts
+               SET picture_url = %s, updated_at = now()
+             WHERE id = %s
+             RETURNING id, email, picture_url
+            """,
+            (pic_url, account_id),
+        )
+        updated = cur.fetchone()
+    conn.commit()
+
+    write_audit(
+        actor_id=user.get("id"), actor_email=user.get("email"), actor_role=user.get("role"),
+        action="update_profile_picture", target="login_accounts", target_id=str(account_id),
+        service="superadmin-service",
+        ip_address=request.client.host if request.client else None,
+    )
+    return {
+        "ok": True,
+        "pictureUrl": pic_url,
+        "id": str((updated or {}).get("id") or account_id),
+    }

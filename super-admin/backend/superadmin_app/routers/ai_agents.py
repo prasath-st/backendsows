@@ -179,6 +179,137 @@ def _version_out(row: dict, template_name: str, agent_id: str, active_prompt_id:
     }
 
 
+# ── Static metadata for the 4 MVP agents ─────────────────────────────────────
+# The agents table only stores runtime config (model_id, is_enabled, active_prompt_id).
+# Display-only fields (name, description, portal) are maintained here alongside the
+# DB-seeded ids so the frontend ai-agents-workspace gets the full shape it expects.
+
+_AGENT_META: dict[str, dict] = {
+    "sow-intake": {
+        "name": "SOW Intake Assistant",
+        "shortName": "SOW Intake",
+        "description": "Normalizes uploaded SOW documents and surfaces risk + compliance flags.",
+        "portal": "enterprise",
+    },
+    "decomposition": {
+        "name": "Decomposition Assistant",
+        "shortName": "Decomposition",
+        "description": "Suggests milestone + task breakdown from approved SOWs.",
+        "portal": "enterprise",
+    },
+    "contributor-support": {
+        "name": "Contributor Support Assistant",
+        "shortName": "Contributor Support",
+        "description": "Helps contributors triage their own questions before opening a ticket.",
+        "portal": "contributor",
+    },
+    "review-assistant": {
+        "name": "Review Assistant",
+        "shortName": "Review",
+        "description": "Drafts rubric-aligned score suggestions for mentor review.",
+        "portal": "mentor",
+    },
+}
+
+
+# ── GET /api/admin/agents ─────────────────────────────────────────────────────
+
+@router.get("/api/admin/agents")
+async def list_agents(
+    admin: Annotated[dict, Depends(get_current_admin)],
+):
+    """
+    Return all registered agents enriched with 24h invocation telemetry.
+
+    Response shape (array item):
+      id, name, shortName, description, portal,
+      status ("enabled"|"paused"), modelId, activePromptId, activePromptVersion,
+      recentInvocations24h, avgLatencyMs, errors24h
+    """
+    conn = _conn()
+
+    # Fetch all agent rows
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, model_id, is_enabled, active_prompt_id, created_at, updated_at "
+            "FROM agents ORDER BY id"
+        )
+        agent_rows = cur.fetchall()
+
+    # Fetch 24h telemetry per agent in one query
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT agent_id,
+                   COUNT(*)                                             AS total,
+                   COUNT(*) FILTER (WHERE status != 'success')         AS errors,
+                   COALESCE(AVG(latency_ms) FILTER (WHERE latency_ms IS NOT NULL), 0) AS avg_latency_ms
+              FROM agent_invocations
+             WHERE created_at >= now() - INTERVAL '24 hours'
+             GROUP BY agent_id
+            """
+        )
+        tele_rows = cur.fetchall()
+
+    telemetry: dict[str, dict] = {
+        r["agent_id"]: {
+            "recentInvocations24h": int(r["total"]),
+            "errors24h": int(r["errors"]),
+            "avgLatencyMs": int(round(float(r["avg_latency_ms"]))),
+        }
+        for r in tele_rows
+    }
+
+    # Resolve active prompt version number for each agent
+    active_ids = [
+        r["active_prompt_id"] for r in agent_rows if r.get("active_prompt_id")
+    ]
+    version_map: dict[str, int] = {}
+    if active_ids:
+        placeholders = ", ".join(["%s"] * len(active_ids))
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT id, version FROM agent_prompt_versions WHERE id IN ({placeholders})",
+                active_ids,
+            )
+            for vrow in cur.fetchall():
+                version_map[vrow["id"]] = vrow["version"]
+
+    items = []
+    for row in agent_rows:
+        agent_id = row["id"]
+        meta = _AGENT_META.get(agent_id, {
+            "name": agent_id,
+            "shortName": agent_id,
+            "description": "",
+            "portal": "all",
+        })
+        tele = telemetry.get(agent_id, {
+            "recentInvocations24h": 0,
+            "errors24h": 0,
+            "avgLatencyMs": 0,
+        })
+        active_prompt_id = row.get("active_prompt_id")
+        items.append({
+            "id": agent_id,
+            "name": meta["name"],
+            "shortName": meta["shortName"],
+            "description": meta["description"],
+            "portal": meta["portal"],
+            "status": "enabled" if row.get("is_enabled") else "paused",
+            "modelId": row.get("model_id") or "glimmora-mock-v1",
+            "activePromptId": active_prompt_id,
+            "activePromptVersion": version_map.get(active_prompt_id) if active_prompt_id else None,
+            "recentInvocations24h": tele["recentInvocations24h"],
+            "avgLatencyMs": tele["avgLatencyMs"],
+            "errors24h": tele["errors24h"],
+            "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+            "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        })
+
+    return {"items": items}
+
+
 # ── GET /api/admin/agents/{agentId}/prompts/{templateName}/versions ──────────
 
 @router.get("/api/admin/agents/{agentId}/prompts/{templateName}/versions")

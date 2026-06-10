@@ -20,11 +20,17 @@ import logging
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from psycopg2.extras import RealDictCursor
+from pydantic import BaseModel
 
+from shared.audit import write_audit
 from shared.db import ensure_pg_clean, get_pg_connection
 from shared.deps import get_current_admin
+from shared.mailer import build_credentials_body, send_email
+from shared.security import generate_temp_password, hash_password
+
+from auth_app import repo as auth_repo
 
 logger = logging.getLogger(__name__)
 
@@ -311,3 +317,88 @@ async def get_tenant(
         sow_count=sow_counts.get(tenant_id, 0),
         sub_row=subscriptions.get(tenant_id),
     )
+
+
+# ── POST /api/superadmin/tenants  (create a tenant + optional first admin) ─────
+
+class _CreateTenantRequest(BaseModel):
+    name: str
+    kind: str = "enterprise"          # enterprise | university | women_team
+    domain: str | None = None
+    region: str | None = None
+    currency: str | None = None
+    # Optional: provision the first enterprise-admin account for this tenant.
+    adminEmail: str | None = None
+    adminFirstName: str | None = None
+    adminLastName: str | None = None
+
+
+def _slug_tenant_id(name: str, kind: str) -> str:
+    import re as _re
+    import secrets as _secrets
+    base = _re.sub(r"[^a-z0-9]+", "-", (name or "tenant").lower()).strip("-")[:24] or "tenant"
+    prefix = {"university": "uni", "women_team": "wt"}.get(kind, "ent")
+    return f"{prefix}-{base}-{_secrets.token_hex(3)}"
+
+
+@router.post("/api/superadmin/tenants", status_code=201)
+async def create_tenant(
+    admin: Annotated[dict, Depends(get_current_admin)],
+    body: _CreateTenantRequest = Body(...),
+):
+    """Create a new tenant (super-admin provisioning). Inserts the tenants row,
+    optionally provisions the first admin account with a default password that
+    must be reset on first login, and emails the credentials."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    kind = body.kind if body.kind in ("enterprise", "university", "women_team") else "enterprise"
+
+    tenant_id = _slug_tenant_id(name, kind)
+    metadata = {
+        "domain": body.domain or f"{tenant_id}.com",
+        "region": body.region, "currency": body.currency or "INR",
+        "status": "active", "createdBy": admin.get("email"),
+    }
+    tenant = auth_repo.create_tenant(tenant_id=tenant_id, name=name, kind=kind, metadata=metadata)
+
+    provisioned_admin = None
+    if body.adminEmail:
+        email = body.adminEmail.strip().lower()
+        if auth_repo.find_account_by_email(email):
+            raise HTTPException(status_code=409, detail="An account with that admin email already exists")
+        temp = generate_temp_password()
+        acct = auth_repo.create_account(
+            email=email, password_hash=hash_password(temp),
+            first_name=body.adminFirstName or "", last_name=body.adminLastName or "",
+            role="enterprise", provider="password", email_verified=True,
+            tenant_id=tenant_id, must_change_password=True,
+        )
+        try:
+            login_url = getattr(__import__("shared.config", fromlist=["settings"]).settings,
+                                "app_base_url", None) or "https://app.glimmora.ai"
+            text, html = build_credentials_body(
+                name=(body.adminFirstName or email), email=email, temp_password=temp,
+                login_url=login_url, org_name=name)
+            send_email(to_email=email, subject="Your Glimmora admin credentials",
+                       body=text, html=html)
+        except Exception:  # noqa: BLE001
+            pass
+        provisioned_admin = {"id": str(acct.get("id")) if isinstance(acct, dict) else None,
+                             "email": email, "mustChangePassword": True}
+
+    try:
+        write_audit(
+            actor_id=admin.get("id"), actor_email=admin.get("email"),
+            actor_role=admin.get("role"), action="create_tenant",
+            target=name, target_id=tenant_id, tenant_id=tenant_id,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "id": tenant_id, "name": name, "kind": kind,
+        "domain": metadata["domain"], "status": "active",
+        "createdAt": _iso(tenant.get("created_at")) if isinstance(tenant, dict) else None,
+        "admin": provisioned_admin,
+    }

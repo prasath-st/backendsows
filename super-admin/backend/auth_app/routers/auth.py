@@ -243,6 +243,10 @@ async def register_enterprise(body: EnterpriseRegisterRequest, request: Request)
         phone=body.phone, provider="password", tenant_id=tenant_id,
     )
     profile_id = repo.create_enterprise_profile(str(row["id"]), body.model_dump(), tenant_id, company_code)
+    # Keep the tenants table in sync — enterprise registration is a tenant-creation
+    # event, so the tenants row must exist (fixes the orphaned-tenant_id gap).
+    repo.ensure_tenant(tenant_id, body.orgName, kind="enterprise",
+                       metadata={"companyCode": company_code, "status": "active"})
     publish_event("enterprise.registered", {"userId": str(row["id"]), "org": body.orgName,
                                              "tenantId": tenant_id, "companyCode": company_code})
     write_audit(actor_id=str(row["id"]), actor_email=row["email"], actor_role="enterprise",

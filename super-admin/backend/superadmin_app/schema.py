@@ -13,6 +13,17 @@ from shared.db import get_pg_connection
 logger = logging.getLogger(__name__)
 
 SUPERADMIN_SCHEMA_SQL = """
+-- ── Contributor KYC submissions (admin KYC review queue + detail) ───────────
+CREATE TABLE IF NOT EXISTS contributor_kyc (
+    account_id   BIGINT PRIMARY KEY REFERENCES login_accounts(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
+    segment      TEXT,
+    data         JSONB NOT NULL DEFAULT '{}',
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_contributor_kyc_status ON contributor_kyc(status);
+
 -- ── Reviewer assignments (a reviewer ↔ project/evidence link) ───────────────
 CREATE TABLE IF NOT EXISTS reviewer_assignments (
     id              BIGSERIAL PRIMARY KEY,

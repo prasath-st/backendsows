@@ -49,6 +49,55 @@ def find_account_by_id(account_id: str) -> dict[str, Any] | None:
         return cur.fetchone()
 
 
+# ── Tenants ──────────────────────────────────────────────────────────────────
+
+def get_tenant(tenant_id: str) -> dict[str, Any] | None:
+    conn = _conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM tenants WHERE id = %s", (tenant_id,))
+        return cur.fetchone()
+
+
+def create_tenant(
+    *,
+    tenant_id: str,
+    name: str,
+    kind: str = "enterprise",
+    metadata: dict[str, Any] | None = None,
+    is_active: bool = True,
+) -> dict[str, Any]:
+    """Insert a tenant row (idempotent — upserts on id so callers can safely
+    'ensure' a tenant). Returns the row."""
+    conn = _conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO tenants (id, name, kind, metadata, is_active)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+               SET name = EXCLUDED.name,
+                   kind = EXCLUDED.kind,
+                   metadata = tenants.metadata || EXCLUDED.metadata
+            RETURNING *
+            """,
+            (tenant_id, name, kind, Json(metadata or {}), is_active),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row
+
+
+def ensure_tenant(tenant_id: str, name: str, kind: str = "enterprise",
+                  metadata: dict[str, Any] | None = None) -> None:
+    """Create the tenant row if it doesn't exist (keeps the tenants table in
+    sync when accounts are provisioned with a tenant_id). Best-effort."""
+    try:
+        if not get_tenant(tenant_id):
+            create_tenant(tenant_id=tenant_id, name=name, kind=kind, metadata=metadata)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def create_account(
     *,
     email: str,
@@ -96,6 +145,23 @@ def set_password(account_id: str, password_hash: str, *, clear_must_change: bool
              WHERE id = %s
             """,
             (password_hash, clear_must_change, account_id),
+        )
+    conn.commit()
+
+
+def set_temp_password(account_id: str, password_hash: str) -> None:
+    """Set a (re)generated default/temp password and FORCE must_change_password
+    so the user is required to reset it on next login. Used by resend-credentials."""
+    conn = _conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE login_accounts
+               SET password_hash = %s, is_password_set = TRUE,
+                   must_change_password = TRUE, updated_at = now()
+             WHERE id = %s
+            """,
+            (password_hash, account_id),
         )
     conn.commit()
 

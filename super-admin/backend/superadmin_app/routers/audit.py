@@ -368,18 +368,21 @@ async def list_all_sows(
 
 @router.get("/api/superadmin/mentors")
 async def list_mentors(admin: Annotated[dict, Depends(get_current_admin)]):
-    """Mentor accounts available for assignment (any role in the mentor family)."""
+    """Mentor accounts (mentor family). Returns both `mentors` (assignment
+    pickers) and `items` (the admin mentors-management page) for compatibility."""
     conn = get_pg_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, email, first_name, last_name, role FROM login_accounts "
+            "SELECT id, email, first_name, last_name, role, is_active, created_at FROM login_accounts "
             "WHERE role LIKE 'mentor%' AND COALESCE(is_active, TRUE) ORDER BY created_at DESC")
-        mentors = [{
-            "id": str(r["id"]), "email": r["email"],
-            "name": (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip() or r["email"]),
-            "role": r["role"],
-        } for r in cur.fetchall()]
-    return {"mentors": mentors, "total": len(mentors)}
+        rows = cur.fetchall()
+    mentors = [{
+        "id": str(r["id"]), "email": r["email"],
+        "name": (f"{r.get('first_name','') or ''} {r.get('last_name','') or ''}".strip() or r["email"]),
+        "role": r["role"], "status": "active" if r.get("is_active", True) else "paused",
+        "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
+    } for r in rows]
+    return {"mentors": mentors, "items": mentors, "total": len(mentors)}
 
 
 @router.get("/api/superadmin/contributors")
