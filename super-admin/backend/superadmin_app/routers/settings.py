@@ -267,7 +267,7 @@ async def test_smtp_config(
         password = stored.get("password") or ""
 
     if not host or not username or not password:
-        return {"ok": False, "sent": False, "message": "Incomplete SMTP config — host, username, and password are required."}
+        return {"ok": False, "success": False, "sent": False, "message": "Incomplete SMTP config — host, username, and password are required."}
 
     try:
         msg = EmailMessage()
@@ -295,14 +295,14 @@ async def test_smtp_config(
             service="superadmin-service",
             ip_address=request.client.host if request.client else None,
         )
-        return {"ok": True, "sent": True, "message": f"Test email sent to {to_email or from_address}."}
+        return {"ok": True, "success": True, "sent": True, "message": f"Test email sent to {to_email or from_address}."}
 
     except smtplib.SMTPAuthenticationError as exc:
         logger.warning("SMTP test auth failed: %s", exc)
-        return {"ok": False, "sent": False, "message": f"Authentication failed: {exc.smtp_error.decode(errors='replace') if hasattr(exc, 'smtp_error') else str(exc)}"}
+        return {"ok": False, "success": False, "sent": False, "message": f"Authentication failed: {exc.smtp_error.decode(errors='replace') if hasattr(exc, 'smtp_error') else str(exc)}"}
     except smtplib.SMTPException as exc:
         logger.warning("SMTP test failed: %s", exc)
-        return {"ok": False, "sent": False, "message": f"SMTP error: {exc}"}
+        return {"ok": False, "success": False, "sent": False, "message": f"SMTP error: {exc}"}
     except OSError as exc:
         logger.warning("SMTP test connection error: %s", exc)
-        return {"ok": False, "sent": False, "message": f"Connection error: {exc}"}
+        return {"ok": False, "success": False, "sent": False, "message": f"Connection error: {exc}"}
