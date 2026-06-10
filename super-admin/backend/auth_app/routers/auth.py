@@ -517,7 +517,13 @@ class _SetupAfterOtp(OtpVerifyRequest):
 async def setup_after_otp(body: _SetupAfterOtp):
     if not body.email:
         raise HTTPException(status_code=422, detail="Email required")
-    if not await verify_otp("email", body.email, body.code):
+    # Accept EITHER a still-valid code OR a recent verification. The FE's 3-step
+    # reset calls otp/verify-email first (which consumes the code and sets the
+    # recently-verified flag), so this final step must not require the code again.
+    ok = await verify_otp("email", body.email, body.code)
+    if not ok:
+        ok = await is_recently_verified("email", body.email)
+    if not ok:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
     row = repo.find_account_by_email(body.email)
     if not row:
