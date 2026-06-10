@@ -488,8 +488,10 @@ async def get_mentor_detail(
     conn = get_pg_connection()
     from psycopg2.extras import RealDictCursor
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # NOTE: escape the LIKE wildcard as %% — psycopg2 treats a bare % as a
+        # parameter placeholder (a single % here caused IndexError).
         cur.execute(
-            "SELECT * FROM login_accounts WHERE id = %s AND LOWER(role) LIKE 'mentor%'",
+            "SELECT * FROM login_accounts WHERE id = %s AND LOWER(role) LIKE 'mentor%%'",
             (mentor_id,),
         )
         row = cur.fetchone()
