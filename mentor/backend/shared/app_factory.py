@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from shared.config import settings
 from shared.db import close_redis_client, ping_redis
@@ -64,6 +65,14 @@ def create_service_app(
         logger.info("[%s] shut down", name)
 
     app = FastAPI(title=f"Glimmora {name}", version="1.0.0", lifespan=lifespan)
+
+    # Behind a TLS-terminating proxy (Railway/Vercel/etc.) the app receives plain
+    # HTTP with the real scheme in X-Forwarded-Proto. Without trusting it, the
+    # request scheme is "http", so FastAPI emits http:// redirects (e.g. the
+    # trailing-slash 307) and clients DROP the Authorization header on that
+    # https->http downgrade. Trusting the forwarded headers keeps redirects https
+    # so the bearer token survives.
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.add_middleware(
         CORSMiddleware,

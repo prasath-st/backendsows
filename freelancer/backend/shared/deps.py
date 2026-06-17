@@ -8,19 +8,28 @@ from __future__ import annotations
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from shared.security import decode_token
+
+# Declaring the scheme this way registers an HTTP "bearer" securityScheme in the
+# OpenAPI schema, so Swagger /docs shows the "Authorize" button and a lock icon
+# on protected routes. auto_error=False keeps our own "Missing bearer token"
+# message (instead of FastAPI's default 403) and lets public routes stay open.
+_bearer_scheme = HTTPBearer(auto_error=False, description="Paste the access_token from /api/v1/auth/login")
 
 
 def _unauthorised(msg: str = "Not authenticated"):
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=msg)
 
 
-def get_bearer_token(authorization: Annotated[str | None, Header()] = None) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
+def get_bearer_token(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)] = None,
+) -> str:
+    if creds is None or (creds.scheme or "").lower() != "bearer" or not creds.credentials:
         raise _unauthorised("Missing bearer token")
-    return authorization.split(" ", 1)[1].strip()
+    return creds.credentials
 
 
 def get_current_user(token: Annotated[str, Depends(get_bearer_token)]) -> dict:
