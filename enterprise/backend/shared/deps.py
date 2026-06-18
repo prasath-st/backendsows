@@ -8,19 +8,26 @@ from __future__ import annotations
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from shared.security import decode_token
+
+# Declared as a security scheme so Swagger UI (/docs) shows the "Authorize"
+# button and injects the `Authorization: Bearer <token>` header on requests.
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _unauthorised(msg: str = "Not authenticated"):
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=msg)
 
 
-def get_bearer_token(authorization: Annotated[str | None, Header()] = None) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
+def get_bearer_token(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)] = None,
+) -> str:
+    if credentials is None or (credentials.scheme or "").lower() != "bearer":
         raise _unauthorised("Missing bearer token")
-    return authorization.split(" ", 1)[1].strip()
+    return credentials.credentials.strip()
 
 
 def get_current_user(token: Annotated[str, Depends(get_bearer_token)]) -> dict:
