@@ -13,13 +13,14 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from shared.config import settings
 from shared.db import close_redis_client, ping_redis
+from shared.deps import verify_passcode
 from shared.kafka_bus import close_producer
 
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +65,12 @@ def create_service_app(
         close_producer()
         logger.info("[%s] shut down", name)
 
-    app = FastAPI(title=f"Glimmora {name}", version="1.0.0", lifespan=lifespan)
+    # Global passcode gate: applies to every route. No-op until a passcode is
+    # configured in .env (GlimmoraTeam_Passcode); exemptions in verify_passcode.
+    app = FastAPI(
+        title=f"Glimmora {name}", version="1.0.0", lifespan=lifespan,
+        dependencies=[Depends(verify_passcode)],
+    )
 
     # Behind a TLS-terminating proxy (Railway/Vercel/etc.) the app receives plain
     # HTTP with the real scheme in X-Forwarded-Proto. Without trusting it, the

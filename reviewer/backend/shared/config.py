@@ -8,6 +8,7 @@ rest is shared so JWTs interoperate across services (same API_SECRET_KEY).
 
 from __future__ import annotations
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,12 @@ class Settings(BaseSettings):
     # ── Service identity (overridden per service via env) ────────────────────
     service_name: str = "glimmora-service"
     service_port: int = 9000
+
+    # ── API passcode gate ────────────────────────────────────────────────────
+    # Shared secret required (in addition to the JWT) on every business API via
+    # the `API-Passcode` header. Set GlimmoraTeam_Passcode in .env to enable;
+    # empty value disables the gate.
+    api_passcode: str = Field(default="", validation_alias="GlimmoraTeam_Passcode")
 
     # ── PostgreSQL (Neon) — full connection URL ──────────────────────────────
     # Async URL for app (asyncpg) and sync URL for psycopg2 / migrations.
